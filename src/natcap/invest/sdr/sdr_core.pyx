@@ -773,7 +773,7 @@ def calculate_average_aspect(
     """
     LOGGER.info('Calculating average aspect')
 
-    cdef float average_aspect_nodata = -1
+    cdef float average_aspect_nodata = numpy.finfo(numpy.float32).min
     pygeoprocessing.new_raster_from_base(
         mfd_flow_direction_path, target_average_aspect_path,
         gdal.GDT_Float32, [average_aspect_nodata], [average_aspect_nodata])

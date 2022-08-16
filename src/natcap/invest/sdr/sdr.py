@@ -205,7 +205,7 @@ _TMP_BASE_FILES = {
 
 # Target nodata is for general rasters that are positive, and _IC_NODATA are
 # for rasters that are any range
-_TARGET_NODATA = -1.0
+_TARGET_NODATA = float(numpy.finfo('float32').min)
 _BYTE_NODATA = 255
 _IC_NODATA = float(numpy.finfo('float32').min)
 
@@ -794,13 +794,19 @@ def _calculate_ls_factor(
         # nodata value from pygeoprocessing
         valid_mask = (
             (~utils.array_equals_nodata(avg_aspect, avg_aspect_nodata)) &
-            ~utils.array_equals_nodata(percent_slope, slope_nodata) &
-            ~utils.array_equals_nodata(
-                flow_accumulation, flow_accumulation_nodata))
+            (~utils.array_equals_nodata(percent_slope, slope_nodata)) &
+            (~utils.array_equals_nodata(
+                flow_accumulation, flow_accumulation_nodata)))
         result = numpy.empty(valid_mask.shape, dtype=numpy.float32)
         result[:] = _TARGET_NODATA
 
         contributing_area = (flow_accumulation[valid_mask]-1) * cell_area
+
+        # From SAGA: specific catchment area (contour length dependent on aspect)
+        contributing_area /= (
+            cell_size * (numpy.fabs(numpy.sin(avg_aspect[valid_mask])) +
+                         numpy.fabs(numpy.cos(avg_aspect[valid_mask]))))
+
         slope_in_radians = numpy.arctan(percent_slope[valid_mask] / 100.0)
 
         # From Equation 4 in "Extension and validation of a geographic
