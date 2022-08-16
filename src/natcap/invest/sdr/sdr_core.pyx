@@ -661,6 +661,99 @@ def calculate_sediment_deposition(
     sediment_deposition_raster.close()
 
 
+def calculate_aspect(dem_path, target_aspect_path, use_degrees=True):
+    LOGGER.info('Calculating aspect')
+
+    cdef float aspect_nodata = numpy.finfo(numpy.float32).min
+    pygeoprocessing.new_raster_from_base(
+        dem_path, target_aspect_path,
+        gdal.GDT_Float32, [aspect_nodata], [aspect_nodata])
+
+    cdef _ManagedRaster dem_managed_raster = _ManagedRaster(
+        dem_path, 1, False)
+
+    cdef _ManagedRaster aspect_managed_raster = _ManagedRaster(
+        target_aspect_path, 1, True)
+
+    dem_info = pygeoprocessing.get_raster_info(dem_path)
+    cdef int dem_nodata = dem_info['nodata'][0]
+    cdef int n_cols, n_rows
+    n_cols, n_rows = dem_info['raster_size']
+    cdef unsigned int n_pixels_visited = 0
+    cdef int seed_row, seed_col, neighbor_row, neighbor_col
+
+    cdef float* dzdx_factors = [2, 1, 0, -1, -2, -1, 0, 1]
+    cdef float* dzdy_factors = [0, -1, -2, -1, 0, 1, 2, 1]
+    for offset_dict in pygeoprocessing.iterblocks(
+            (target_aspect_path, 1), offset_only=True, largest_block=0):
+        win_xsize = offset_dict['win_xsize']
+        win_ysize = offset_dict['win_ysize']
+        xoff = offset_dict['xoff']
+        yoff = offset_dict['yoff']
+
+        LOGGER.info('Aspect %.2f%% complete', 100 * (
+            n_pixels_visited / float(n_cols * n_rows)))
+
+        for row_index in range(win_ysize):
+            seed_row = yoff + row_index
+            for col_index in range(win_xsize):
+                seed_col = xoff + col_index
+
+                # Skip calculating aspect on this pixel if it's nodata.
+                seed_elevation = dem_managed_raster.get(
+                    seed_col, seed_row)
+                if seed_elevation == dem_nodata:
+                    continue
+
+                # https://desktop.arcgis.com/en/arcmap/10.3/tools/spatial-analyst-toolbox/how-aspect-works.htm#ESRI_SECTION1_4198691F8852475A9F4BC71246579FAA
+                dz_n_pixels = 0
+                dzdx = 0
+                dzdy = 0
+                for neighbor_index in range(8):
+                    neighbor_col = seed_col + COL_OFFSETS[neighbor_index]
+                    if neighbor_col == -1 or neighbor_col == n_cols:
+                        continue
+
+                    neighbor_row = seed_row + ROW_OFFSETS[neighbor_index]
+                    if neighbor_row == -1 or neighbor_row == n_rows:
+                        continue
+
+                    neighbor_elevation = dem_managed_raster.get(
+                        neighbor_col, neighbor_row)
+                    if neighbor_elevation == dem_nodata:
+                        continue
+
+                    dz_n_pixels += 1
+                    dzdx += neighbor_elevation * dzdx_factors[neighbor_index]
+                    dzdy += neighbor_elevation * dzdy_factors[neighbor_index]
+
+                dzdx /= dz_n_pixels
+                dzdy /= dz_n_pixels
+
+                # 1 radian is 57.29578 degrees
+                aspect_degrees = 57.29578 * cmath.atan2(dzdy, -1*dzdx)
+                if aspect_degrees < 0:
+                    aspect_degrees = 90 - aspect_degrees
+                elif aspect_degrees > 90:
+                    aspect_degrees = 360 - aspect_degrees + 90
+                else:
+                    aspect_degrees = 90 - aspect_degrees
+
+                if use_degrees:
+                    aspect = aspect_degrees
+                else:
+                    # convert to radians
+                    aspect = aspect_degrees * (PI / 180.)
+
+                aspect_managed_raster.set(
+                    seed_col, seed_row, aspect)
+
+
+    LOGGER.info('Aspect 100.00% complete')
+    dem_managed_raster.close()
+    aspect_managed_raster.close()
+
+
 def calculate_average_aspect(
         mfd_flow_direction_path, target_average_aspect_path):
     """Calculate the Weighted Average Aspect Ratio from MFD.

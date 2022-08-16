@@ -17,14 +17,13 @@ import taskgraph
 from osgeo import gdal
 from osgeo import ogr
 
-from ..model_metadata import MODEL_METADATA
 from .. import gettext
 from .. import spec_utils
 from .. import utils
 from .. import validation
+from ..model_metadata import MODEL_METADATA
 from ..spec_utils import u
 from . import sdr_core
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -166,6 +165,7 @@ _OUTPUT_BASE_FILES = {
 INTERMEDIATE_DIR_NAME = 'intermediate_outputs'
 
 _INTERMEDIATE_BASE_FILES = {
+    'aspect_path': 'aspect.tif',
     'cp_factor_path': 'cp.tif',
     'd_dn_bare_soil_path': 'd_dn_bare_soil.tif',
     'd_dn_path': 'd_dn.tif',
@@ -373,6 +373,18 @@ def execute(args):
         dependent_task_list=[flow_dir_task],
         task_name='weighted average of multiple-flow aspects')
 
+    aspect_task = task_graph.add_task(
+        func=sdr_core.calculate_aspect,
+        kwargs={
+            'dem_path': f_reg['pit_filled_dem_path'],
+            'target_aspect_path': f_reg['aspect_path'],
+            'use_degrees': False,
+        },
+        target_path_list=[f_reg['aspect_path']],
+        dependent_task_list=[pit_fill_task],
+        task_name='Calculate aspect'
+    )
+
     flow_accumulation_task = task_graph.add_task(
         func=pygeoprocessing.routing.flow_accumulation_mfd,
         args=(
@@ -387,12 +399,14 @@ def execute(args):
         args=(
             f_reg['flow_accumulation_path'],
             f_reg['slope_path'],
-            f_reg['weighted_avg_aspect_path'],
+            #f_reg['weighted_avg_aspect_path'],
+            f_reg['aspect_path'],
             float(args['l_max']),
             f_reg['ls_path']),
         target_path_list=[f_reg['ls_path']],
         dependent_task_list=[
             flow_accumulation_task, slope_task,
+            aspect_task,
             weighted_avg_aspect_task],
         task_name='ls factor calculation')
 
