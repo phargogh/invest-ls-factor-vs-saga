@@ -340,22 +340,6 @@ def execute(args):
         dependent_task_list=[align_task],
         task_name='fill pits')
 
-    slope_task = task_graph.add_task(
-        func=pygeoprocessing.calculate_slope,
-        args=(
-            (f_reg['pit_filled_dem_path'], 1),
-            f_reg['slope_path']),
-        dependent_task_list=[pit_fill_task],
-        target_path_list=[f_reg['slope_path']],
-        task_name='calculate slope')
-
-    threshold_slope_task = task_graph.add_task(
-        func=_threshold_slope,
-        args=(f_reg['slope_path'], f_reg['thresholded_slope_path']),
-        target_path_list=[f_reg['thresholded_slope_path']],
-        dependent_task_list=[slope_task],
-        task_name='threshold slope')
-
     flow_dir_task = task_graph.add_task(
         func=pygeoprocessing.routing.flow_dir_mfd,
         args=(
@@ -385,21 +369,51 @@ def execute(args):
         task_name='Calculate aspect'
     )
 
+    cell_size = abs(pygeoprocessing.get_raster_info(
+        f_reg['flow_direction_path'])['pixel_size'][0])
+    weights_path = os.path.join(intermediate_output_dir, 'weights.tif')
+    pygeoprocessing.new_raster_from_base(
+        f_reg['flow_direction_path'], weights_path,
+        gdal.GDT_Float32, [_TARGET_NODATA],
+        [cell_size])
+
     flow_accumulation_task = task_graph.add_task(
         func=pygeoprocessing.routing.flow_accumulation_mfd,
         args=(
             (f_reg['flow_direction_path'], 1),
             f_reg['flow_accumulation_path']),
+        #kwargs={
+        #    'weight_raster_path_band': (weights_path, 1)
+        #},
         target_path_list=[f_reg['flow_accumulation_path']],
         dependent_task_list=[flow_dir_task],
         task_name='flow accumulation calculation')
+
+    slope_task = task_graph.add_task(
+        # func=pygeoprocessing.calculate_slope,
+        func=sdr_core.calculate_slope,
+        # func=sdr_core.calculate_dist_weighted_slope,
+        args=(
+            (f_reg['pit_filled_dem_path'], 1),
+            (f_reg['flow_accumulation_path'], 1),
+            f_reg['slope_path']),
+        dependent_task_list=[pit_fill_task],
+        target_path_list=[f_reg['slope_path']],
+        task_name='calculate slope')
+
+    threshold_slope_task = task_graph.add_task(
+        func=_threshold_slope,
+        args=(f_reg['slope_path'], f_reg['thresholded_slope_path']),
+        target_path_list=[f_reg['thresholded_slope_path']],
+        dependent_task_list=[slope_task],
+        task_name='threshold slope')
 
     ls_factor_task = task_graph.add_task(
         func=_calculate_ls_factor,
         args=(
             f_reg['flow_accumulation_path'],
             f_reg['slope_path'],
-            #f_reg['weighted_avg_aspect_path'],
+            f_reg['weighted_avg_aspect_path'],
             f_reg['aspect_path'],
             float(args['l_max']),
             f_reg['ls_path']),
@@ -740,8 +754,8 @@ def _calculate_what_drains_to_stream(
 
 
 def _calculate_ls_factor(
-        flow_accumulation_path, slope_path, avg_aspect_path, l_max,
-        target_ls_prime_factor_path):
+        flow_accumulation_path, slope_path, avg_aspect_path, true_aspect_path,
+        l_max, target_ls_prime_factor_path):
     """Calculate LS factor.
 
     Calculates a modified LS factor as Equation 3 from "Extension and
@@ -757,6 +771,7 @@ def _calculate_ls_factor(
         slope_path (string): path to slope raster as a percent
         avg_aspect_path (string): The path to to raster of the weighted average
             of aspects based on proportional flow.
+        true_aspect_path (string): True aspect.
         l_max (float): if the calculated value of L exceeds this value
             it is clamped to this value.
         target_ls_prime_factor_path (string): path to output ls_prime_factor
@@ -777,7 +792,7 @@ def _calculate_ls_factor(
     cell_area = cell_size ** 2
 
     def ls_factor_function(
-            percent_slope, flow_accumulation, avg_aspect, l_max):
+            percent_slope, flow_accumulation, avg_aspect, true_aspect, l_max):
         """Calculate the LS' factor.
 
         Args:
@@ -800,25 +815,32 @@ def _calculate_ls_factor(
         result = numpy.empty(valid_mask.shape, dtype=numpy.float32)
         result[:] = _TARGET_NODATA
 
+        # SAGA uses cell area (m^2) as contributing area.
         contributing_area = (flow_accumulation[valid_mask]-1) * cell_area
 
-        # From SAGA: specific catchment area (contour length dependent on aspect)
-        contributing_area /= (
-            cell_size * (numpy.fabs(numpy.sin(avg_aspect[valid_mask])) +
-                         numpy.fabs(numpy.cos(avg_aspect[valid_mask]))))
 
+        # This is SAGA Method_Area=0
+        # https://github.com/saga-gis/saga-gis/blob/master/saga-gis/src/tools/terrain_analysis/ta_hydrology/Erosion_LS_Fields.cpp#L350
+        #contributing_area /= cell_size
+
+        # contributing area /= (cell_size * true_aspect[valid_mask]) is SAGA Method_Area=1
+        #contributing_area /= (cell_size * avg_aspect[valid_mask])
+
+        # This represents SAGA Method_Slope=1
+        # https://github.com/saga-gis/saga-gis/blob/master/saga-gis/src/tools/terrain_analysis/ta_hydrology/Erosion_LS_Fields.cpp#L327
+        # https://github.com/saga-gis/saga-gis/blob/master/saga-gis/src/tools/terrain_analysis/ta_hydrology/Erosion_LS_Fields.cpp#L464
+        #percent_slope[valid_mask] = (
+        #    percent_slope[valid_mask] * numpy.log(
+        #        numpy.maximum(
+        #            contributing_area,
+        #            numpy.ones_like(contributing_area))))
+
+        # SAGA assumes that slope and aspect are both in radians.
         slope_in_radians = numpy.arctan(percent_slope[valid_mask] / 100.0)
-
-        # From Equation 4 in "Extension and validation of a geographic
-        # information system ..."
-        slope_factor = numpy.where(
-            percent_slope[valid_mask] < 9.0,
-            10.8 * numpy.sin(slope_in_radians) + 0.03,
-            16.8 * numpy.sin(slope_in_radians) - 0.5)
 
         beta = (
             (numpy.sin(slope_in_radians) / 0.0896) /
-            (3 * numpy.sin(slope_in_radians)**0.8 + 0.56))
+            (3 * (numpy.sin(slope_in_radians)**0.8) + 0.56))
 
         # Set m value via lookup table: Table 1 in
         # InVEST Sediment Model_modifications_10-01-2012_RS.docx
@@ -830,27 +852,55 @@ def _calculate_ls_factor(
         m_indexes = numpy.digitize(
             percent_slope[valid_mask][~big_slope_mask], slope_table,
             right=True)
-        m_exp = numpy.empty(big_slope_mask.shape, dtype=numpy.float32)
-        m_exp[big_slope_mask] = (
-            beta[big_slope_mask] / (1 + beta[big_slope_mask]))
-        m_exp[~big_slope_mask] = m_table[m_indexes]
+        #m_exp = numpy.empty(big_slope_mask.shape, dtype=numpy.float32)
+        #m_exp[big_slope_mask] = (
+        #    beta[big_slope_mask] / (1 + beta[big_slope_mask]))
+        #m_exp[~big_slope_mask] = m_table[m_indexes]
+
+        # This is how SAGA calculates m_exp
+        # https://github.com/saga-gis/saga-gis/blob/master/saga-gis/src/tools/terrain_analysis/ta_hydrology/Erosion_LS_Fields.cpp#L487
+        m_exp = (beta / (1. + beta)).astype(numpy.float32)
+
+        #aspect = (
+        #    numpy.sin(avg_aspect[valid_mask]) +
+        #    numpy.cos(avg_aspect[valid_mask]))
+        #aspect = avg_aspect[valid_mask]
+
+        # SAGA calculates aspect from true on-pixel aspect, not the weighted
+        # average of aspect from or to neighbors.
+        # https://github.com/saga-gis/saga-gis/blob/master/saga-gis/src/tools/terrain_analysis/ta_hydrology/Erosion_LS_Fields.cpp#L490
+        aspect = (
+            numpy.fabs(numpy.sin(true_aspect[valid_mask])) +
+            numpy.fabs(numpy.cos(true_aspect[valid_mask])))
 
         l_factor = (
             ((contributing_area + cell_area)**(m_exp+1) -
              contributing_area ** (m_exp+1)) /
-            ((cell_size ** (m_exp + 2)) * (avg_aspect[valid_mask]**m_exp) *
+            ((cell_size**(m_exp + 2)) * (aspect**m_exp) *
              (22.13**m_exp)))
 
         # threshold L factor to l_max
         l_factor[l_factor > l_max] = l_max
 
+        # From Equation 4 in "Extension and validation of a geographic
+        # information system ..."
+        slope_factor = numpy.where(
+            percent_slope[valid_mask] < 9.0,
+            10.8 * numpy.sin(slope_in_radians) + 0.03,
+            16.8 * numpy.sin(slope_in_radians) - 0.5)
+
         result[valid_mask] = l_factor * slope_factor
+        #if numpy.any(numpy.isclose(result[valid_mask], _TARGET_NODATA)):
+        #    import pdb; pdb.set_trace()
+        #    pass
+
         return result
 
     # call vectorize datasets to calculate the ls_factor
     pygeoprocessing.raster_calculator(
         [(path, 1) for path in [
-            slope_path, flow_accumulation_path, avg_aspect_path]] + [
+            slope_path, flow_accumulation_path, avg_aspect_path,
+            true_aspect_path]] + [
             (l_max, 'raw')],
         ls_factor_function, target_ls_prime_factor_path, gdal.GDT_Float32,
         _TARGET_NODATA)

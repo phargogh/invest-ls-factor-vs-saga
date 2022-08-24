@@ -1,13 +1,20 @@
 # cython: profile=False
 # cython: language_level=3
 import logging
+import tempfile
 import os
+import shutil
 
 import numpy
 import pygeoprocessing
 cimport numpy
 cimport cython
 from osgeo import gdal
+from pygeoprocessing.geoprocessing_core import DEFAULT_GTIFF_CREATION_TUPLE_OPTIONS
+from pygeoprocessing.routing.routing import (
+    _generate_read_bounds,
+    _is_raster_path_band_formatted
+)
 
 from cpython.mem cimport PyMem_Malloc, PyMem_Free
 from cython.operator cimport dereference as deref
@@ -16,13 +23,30 @@ from libcpp.pair cimport pair
 from libcpp.set cimport set as cset
 from libcpp.list cimport list as clist
 from libcpp.stack cimport stack
+from libc.time cimport time_t
+from libc.time cimport time as ctime
 cimport libc.math as cmath
+from libcpp.stack cimport stack
 
 cdef extern from "time.h" nogil:
     ctypedef int time_t
     time_t time(time_t*)
 
 LOGGER = logging.getLogger(__name__)
+
+cdef int _is_close(double x, double y, double abs_delta, double rel_delta):
+    return abs(x-y) <= (abs_delta+rel_delta*abs(y))
+
+cdef float _LOGGING_PERIOD = 10.0
+cdef double IMPROBABLE_FLOAT_NODATA = -1.23789789e29
+cdef struct FlowPixelType:
+    int xi
+    int yi
+    int last_flow_dir
+    double value
+cdef int *D8_XOFFSET = [1, 1, 0, -1, -1, -1, 0, 1]
+cdef int *D8_YOFFSET = [0, -1, -1, -1, 0, +1, +1, +1]
+cdef int* D8_REVERSE_DIRECTION = [4, 5, 6, 7, 0, 1, 2, 3]
 
 
 # cmath is supposed to have M_SQRT2, but tests have been failing recently
@@ -40,6 +64,9 @@ cdef int MANAGED_RASTER_N_BLOCKS = 2**6
 #           5 6 7
 cdef int *ROW_OFFSETS = [0, -1, -1, -1,  0,  1, 1, 1]
 cdef int *COL_OFFSETS = [1,  1,  0, -1, -1, -1, 0, 1]
+
+cdef float* FLOW_LENGTH = [1, SQRT2, 1, SQRT2, 1, SQRT2, 1, SQRT2]
+
 
 
 cdef int is_close(double x, double y):
@@ -661,6 +688,207 @@ def calculate_sediment_deposition(
     sediment_deposition_raster.close()
 
 
+def calculate_slope(dem_path_band, flow_accum_path_not_used, target_slope_path):
+    cdef float slope_nodata = numpy.finfo(numpy.float32).min
+    pygeoprocessing.new_raster_from_base(
+        dem_path_band[0], target_slope_path,
+        gdal.GDT_Float32, [slope_nodata], [slope_nodata])
+
+    cdef _ManagedRaster dem_managed_raster = _ManagedRaster(
+        dem_path_band[0], dem_path_band[1], False)
+    cdef _ManagedRaster slope_managed_raster = _ManagedRaster(
+        target_slope_path, 1, True)
+
+    dem_info = pygeoprocessing.get_raster_info(dem_path_band[0])
+    cdef int dem_nodata = dem_info['nodata'][0]
+    cdef int n_cols, n_rows
+    n_cols, n_rows = dem_info['raster_size']
+    cdef float cellsize = abs(dem_info['pixel_size'][0])
+
+    cdef float* neighbor_z = [0, 0, 0, 0, 0, 0, 0, 0]
+    cdef float G, H
+    cdef long n_pixels_visited = 0
+
+    for offset_dict in pygeoprocessing.iterblocks(
+            (target_slope_path, 1), offset_only=True, largest_block=0):
+        win_xsize = offset_dict['win_xsize']
+        win_ysize = offset_dict['win_ysize']
+        xoff = offset_dict['xoff']
+        yoff = offset_dict['yoff']
+
+        LOGGER.info('Aspect %.2f%% complete', 100 * (
+            n_pixels_visited / float(n_cols * n_rows)))
+
+        for row_index in range(win_ysize):
+            seed_row = yoff + row_index
+            for col_index in range(win_xsize):
+                seed_col = xoff + col_index
+
+                # Skip calculating aspect on this pixel if it's nodata.
+                seed_elevation = dem_managed_raster.get(
+                    seed_col, seed_row)
+                if seed_elevation == dem_nodata:
+                    continue
+
+                # reset the neighbor_z list
+                for i in range(8):
+                    neighbor_z[i] = 0
+
+                for neighbor_index in range(0, 8, 2):
+                    neighbor_row = seed_row + ROW_OFFSETS[neighbor_index]
+                    if neighbor_row == -1 or neighbor_row == n_rows:
+                        continue
+
+                    neighbor_col = seed_col + COL_OFFSETS[neighbor_index]
+                    if neighbor_col == -1 or neighbor_col == n_cols:
+                        continue
+
+                    neighbor_elevation = dem_managed_raster.get(
+                        neighbor_col, neighbor_row)
+                    if neighbor_elevation == dem_nodata:
+                        continue
+
+                    neighbor_z[neighbor_index] = seed_elevation - neighbor_elevation
+
+                G = (neighbor_z[0*2] - neighbor_z[2*2]) / (2.*cellsize)
+                H = (neighbor_z[1*2] - neighbor_z[3*2]) / (2.*cellsize)
+
+                slope_managed_raster.set(
+                    seed_col, seed_row, cmath.atan(cmath.sqrt(G**2 + H**2)))
+
+    slope_managed_raster.close()
+    dem_managed_raster.close()
+
+
+
+def calculate_dist_weighted_slope(
+        dem_path_band, mfd_flow_accum_path_band, target_slope_path):
+    cdef float slope_nodata = numpy.finfo(numpy.float32).min
+    pygeoprocessing.new_raster_from_base(
+        dem_path_band[0], target_slope_path,
+        gdal.GDT_Float32, [slope_nodata], [slope_nodata])
+
+    cdef _ManagedRaster dem_managed_raster = _ManagedRaster(
+        dem_path_band[0], dem_path_band[1], False)
+    cdef _ManagedRaster slope_managed_raster = _ManagedRaster(
+        target_slope_path, 1, True)
+    cdef _ManagedRaster mfd_flow_accum_managed_raster = _ManagedRaster(
+        mfd_flow_accum_path_band[0], mfd_flow_accum_path_band[1], False)
+
+    dem_info = pygeoprocessing.get_raster_info(dem_path_band[0])
+    cdef int dem_nodata = dem_info['nodata'][0]
+    cdef int n_cols, n_rows
+    n_cols, n_rows = dem_info['raster_size']
+    cdef float cellsize = abs(dem_info['pixel_size'][0])
+
+    cdef float* neighbor_z = [0, 0, 0, 0, 0, 0, 0, 0]
+    cdef float G, H
+    cdef long n_pixels_visited = 0
+    cdef float* neighbor_slopes = [0, 0, 0, 0, 0, 0, 0, 0]
+
+    for offset_dict in pygeoprocessing.iterblocks(
+            (target_slope_path, 1), offset_only=True, largest_block=0):
+        win_xsize = offset_dict['win_xsize']
+        win_ysize = offset_dict['win_ysize']
+        xoff = offset_dict['xoff']
+        yoff = offset_dict['yoff']
+
+        LOGGER.info('Aspect %.2f%% complete', 100 * (
+            n_pixels_visited / float(n_cols * n_rows)))
+
+        for row_index in range(win_ysize):
+            seed_row = yoff + row_index
+            for col_index in range(win_xsize):
+                seed_col = xoff + col_index
+
+                # Skip calculating aspect on this pixel if it's nodata.
+                seed_elevation = dem_managed_raster.get(
+                    seed_col, seed_row)
+                if seed_elevation == dem_nodata:
+                    continue
+
+                seed_up_area = mfd_flow_accum_managed_raster.get(seed_col, seed_row)-1
+
+                # reset the neighbor_z list
+                for i in range(8):
+                    neighbor_z[i] = 0
+
+                for neighbor_index in range(0, 8, 2):
+                    neighbor_row = seed_row + ROW_OFFSETS[neighbor_index]
+                    if neighbor_row == -1 or neighbor_row == n_rows:
+                        continue
+
+                    neighbor_col = seed_col + COL_OFFSETS[neighbor_index]
+                    if neighbor_col == -1 or neighbor_col == n_cols:
+                        continue
+
+                    neighbor_elevation = dem_managed_raster.get(
+                        neighbor_col, neighbor_row)
+                    if neighbor_elevation == dem_nodata:
+                        continue
+
+                    neighbor_z[neighbor_index] = seed_elevation - neighbor_elevation
+
+                G = (neighbor_z[0*2] - neighbor_z[2*2]) / (2.*cellsize)
+                H = (neighbor_z[1*2] - neighbor_z[3*2]) / (2.*cellsize)
+
+                existing_slope = slope_managed_raster.get(seed_col, seed_row)
+                if existing_slope == slope_nodata:
+                    existing_slope = 0
+                onseed_slope = cmath.atan(cmath.sqrt(G*G + H*H))
+                upslope = existing_slope + cmath.log(seed_up_area) * onseed_slope
+
+                slope_managed_raster.set(
+                    seed_col, seed_row, upslope)
+
+                neighbor_slopes_sum = 0
+                for neighbor_index in range(8):
+                    neighbor_slopes[neighbor_index] = 0
+                    neighbor_row = seed_row + ROW_OFFSETS[neighbor_index]
+                    if neighbor_row < 0 or neighbor_row >= n_rows:
+                        continue
+                    neighbor_col = seed_col + COL_OFFSETS[neighbor_index]
+                    if neighbor_col < 0 or neighbor_col >= n_cols:
+                        continue
+
+                    # SAGA skips any neighbors that are level with or higher
+                    # than the current pixel
+                    neighbor_elevation = dem_managed_raster.get(
+                        neighbor_col, neighbor_row)
+                    d = seed_elevation - neighbor_elevation
+                    if d <= 0:
+                        continue
+
+                    flow_length = FLOW_LENGTH[neighbor_index] * cellsize
+                    neighbor_slope_dz = (d / flow_length)**1.1
+                    neighbor_slopes[neighbor_index] = neighbor_slope_dz
+                    neighbor_slopes_sum += neighbor_slope_dz
+
+                for neighbor_index in range(8):
+                    neighbor_row = seed_row + ROW_OFFSETS[neighbor_index]
+                    if neighbor_row < 0 or neighbor_row >= n_rows:
+                        continue
+                    neighbor_col = seed_col + COL_OFFSETS[neighbor_index]
+                    if neighbor_col < 0 or neighbor_col >= n_cols:
+                        continue
+
+                    neighbor_slope = slope_managed_raster.get(neighbor_col, neighbor_row)
+                    if neighbor_slope == slope_nodata:
+                        neighbor_slope = 0
+
+                    # avoid division by zero, falling back to neighbor_slope if the sum of neighbor slopes is 0.
+                    if neighbor_slopes_sum > 0:
+                        neighbor_slope += upslope * neighbor_slopes[neighbor_index] / neighbor_slopes_sum
+
+                    slope_managed_raster.set(
+                        neighbor_col, neighbor_row, neighbor_slope)
+
+    slope_managed_raster.close()
+    dem_managed_raster.close()
+
+
+
+
 def calculate_aspect(dem_path, target_aspect_path, use_degrees=True):
     LOGGER.info('Calculating aspect')
 
@@ -876,3 +1104,295 @@ def calculate_average_aspect(
 
     mfd_flow_direction_raster.close()
     average_aspect_raster.close()
+
+
+
+def flow_accumulation_mfd(
+        flow_dir_mfd_raster_path_band, target_flow_accum_raster_path,
+        avg_aspect_raster_path_band,
+        weight_raster_path_band=None,
+        raster_driver_creation_tuple=DEFAULT_GTIFF_CREATION_TUPLE_OPTIONS):
+    """Multiple flow direction accumulation.
+
+    Parameters:
+        flow_dir_mfd_raster_path_band (tuple): a path, band number tuple
+            for a multiple flow direction raster generated from a call to
+            ``flow_dir_mfd``. The format of this raster is described in the
+            docstring of that function.
+        target_flow_accum_raster_path (str): a path to a raster created by
+            a call to this function that is the same dimensions and projection
+            as ``flow_dir_mfd_raster_path_band[0]``. The value in each pixel is
+            1 plus the proportional contribution of all upstream pixels that
+            flow into it. The proportion is determined as the value of the
+            upstream flow dir pixel in the downslope direction pointing to
+            the current pixel divided by the sum of all the flow weights
+            exiting that pixel. Note the target type of this raster
+            is a 64 bit float so there is minimal risk of overflow and the
+            possibility of handling a float dtype in
+            ``weight_raster_path_band``.
+        avg_aspect_raster_path_band (tuple): as here in sdr_core.
+        weight_raster_path_band (tuple): optional path and band number to a
+            raster that will be used as the per-pixel flow accumulation
+            weight. If ``None``, 1 is the default flow accumulation weight.
+            This raster must be the same dimensions as
+            ``flow_dir_mfd_raster_path_band``. If a weight nodata pixel is
+            encountered it will be treated as a weight value of 0.
+        raster_driver_creation_tuple (tuple): a tuple containing a GDAL driver
+            name string as the first element and a GDAL creation options
+            tuple/list as the second. Defaults to a GTiff driver tuple
+            defined at geoprocessing.DEFAULT_GTIFF_CREATION_TUPLE_OPTIONS.
+
+    Returns:
+        None.
+
+    """
+    # These variables are used to iterate over the DEM using `iterblock`
+    # indexes, a numpy.float64 type is used since we need to statically cast
+    # and it's the most complex numerical type and will be compatible without
+    # data loss for any lower type that might be used in
+    # `dem_raster_path_band[0]`.
+    cdef numpy.ndarray[numpy.int32_t, ndim=2] flow_dir_mfd_buffer_array
+    cdef int win_ysize, win_xsize, xoff, yoff
+
+    # These are used to estimate % complete
+    cdef long long visit_count, pixel_count
+
+    # the _root variables remembers the pixel index where the plateau/pit
+    # region was first detected when iterating over the DEM.
+    cdef int xi_root, yi_root
+
+    # these variables are used as pixel or neighbor indexes.
+    # _n is related to a neighbor pixel
+    cdef int i_n, xi, yi, xi_n, yi_n, i_upstream_flow
+
+    # used to hold flow direction values
+    cdef int flow_dir_mfd, upstream_flow_weight
+
+    # used as a holder variable to account for upstream flow
+    cdef int compressed_upstream_flow_dir, upstream_flow_dir_sum
+
+    # used to determine if the upstream pixel has been processed, and if not
+    # to trigger a recursive uphill walk
+    cdef double upstream_flow_accum
+
+    cdef double flow_accum_nodata = IMPROBABLE_FLOAT_NODATA
+    cdef double weight_nodata = IMPROBABLE_FLOAT_NODATA
+
+    # this value is used to store the current weight which might be 1 or
+    # come from a predefined flow accumulation weight raster
+    cdef double weight_val
+
+    # `search_stack` is used to walk upstream to calculate flow accumulation
+    # values represented in a flow pixel which stores the x/y position,
+    # next direction to check, and running flow accumulation value.
+    cdef stack[FlowPixelType] search_stack
+    cdef FlowPixelType flow_pixel
+
+    # properties of the parallel rasters
+    cdef int raster_x_size, raster_y_size
+
+    # used for time-delayed logging
+    cdef time_t last_log_time
+    last_log_time = ctime(NULL)
+
+    if not _is_raster_path_band_formatted(flow_dir_mfd_raster_path_band):
+        raise ValueError(
+            "%s is supposed to be a raster band tuple but it's not." % (
+                flow_dir_mfd_raster_path_band))
+    if weight_raster_path_band and not _is_raster_path_band_formatted(
+            weight_raster_path_band):
+        raise ValueError(
+            "%s is supposed to be a raster band tuple but it's not." % (
+                weight_raster_path_band))
+
+    LOGGER.debug('creating target flow accum raster layer')
+    pygeoprocessing.new_raster_from_base(
+        flow_dir_mfd_raster_path_band[0], target_flow_accum_raster_path,
+        gdal.GDT_Float64, [flow_accum_nodata],
+        raster_driver_creation_tuple=raster_driver_creation_tuple)
+
+    flow_accum_managed_raster = _ManagedRaster(
+        target_flow_accum_raster_path, 1, 1)
+
+    avg_aspect_managed_raster = _ManagedRaster(
+        avg_aspect_raster_path_band[0], avg_aspect_raster_path_band[1], False)
+
+    # make a temporary raster to mark where we have visisted
+    LOGGER.debug('creating visited raster layer')
+    tmp_dir_root = os.path.dirname(target_flow_accum_raster_path)
+    tmp_dir = tempfile.mkdtemp(dir=tmp_dir_root, prefix='mfd_flow_dir_')
+    visited_raster_path = os.path.join(tmp_dir, 'visited.tif')
+    pygeoprocessing.new_raster_from_base(
+        flow_dir_mfd_raster_path_band[0], visited_raster_path,
+        gdal.GDT_Byte, [0],
+        raster_driver_creation_tuple=('GTiff', (
+            'SPARSE_OK=TRUE', 'TILED=YES', 'BIGTIFF=YES', 'COMPRESS=LZW',
+            'BLOCKXSIZE=%d' % (1 << BLOCK_BITS),
+            'BLOCKYSIZE=%d' % (1 << BLOCK_BITS))))
+    visited_managed_raster = _ManagedRaster(visited_raster_path, 1, 1)
+
+    flow_dir_managed_raster = _ManagedRaster(
+        flow_dir_mfd_raster_path_band[0], flow_dir_mfd_raster_path_band[1], 0)
+    flow_dir_raster = gdal.OpenEx(
+        flow_dir_mfd_raster_path_band[0], gdal.OF_RASTER)
+    flow_dir_band = flow_dir_raster.GetRasterBand(
+        flow_dir_mfd_raster_path_band[1])
+
+    cdef _ManagedRaster weight_raster = None
+    if weight_raster_path_band:
+        weight_raster = _ManagedRaster(
+            weight_raster_path_band[0], weight_raster_path_band[1], 0)
+        raw_weight_nodata = pygeoprocessing.get_raster_info(
+            weight_raster_path_band[0])['nodata'][
+                weight_raster_path_band[1]-1]
+        if raw_weight_nodata is not None:
+            weight_nodata = raw_weight_nodata
+
+    flow_dir_raster_info = pygeoprocessing.get_raster_info(
+        flow_dir_mfd_raster_path_band[0])
+    raster_x_size, raster_y_size = flow_dir_raster_info['raster_size']
+    pixel_count = raster_x_size * raster_y_size
+    visit_count = 0
+
+    cdef float cell_size = cmath.fabs(flow_dir_raster_info['cell_size'])
+
+    LOGGER.debug('starting search')
+    # this outer loop searches for a pixel that is locally undrained
+    for offset_dict in pygeoprocessing.iterblocks(
+            flow_dir_mfd_raster_path_band, offset_only=True,
+            largest_block=0):
+        win_xsize = offset_dict['win_xsize']
+        win_ysize = offset_dict['win_ysize']
+        xoff = offset_dict['xoff']
+        yoff = offset_dict['yoff']
+
+        if ctime(NULL) - last_log_time > _LOGGING_PERIOD:
+            last_log_time = ctime(NULL)
+            current_pixel = xoff + yoff * raster_x_size
+            LOGGER.info('%.1f%% complete', 100.0 * current_pixel / <float>(
+                raster_x_size * raster_y_size))
+
+        # make a buffer big enough to capture block and boundaries around it
+        flow_dir_mfd_buffer_array = numpy.empty(
+            (offset_dict['win_ysize']+2, offset_dict['win_xsize']+2),
+            dtype=numpy.int32)
+        flow_dir_mfd_buffer_array[:] = 0  # 0 means no flow at all
+
+        # check if we can widen the border to include real data from the
+        # raster
+        (xa, xb, ya, yb), modified_offset_dict = _generate_read_bounds(
+            offset_dict, raster_x_size, raster_y_size)
+        flow_dir_mfd_buffer_array[ya:yb, xa:xb] = flow_dir_band.ReadAsArray(
+                **modified_offset_dict).astype(numpy.int32)
+
+        # ensure these are set for the complier
+        xi_n = -1
+        yi_n = -1
+
+        # search block for to set flow accumulation
+        for yi in range(1, win_ysize+1):
+            for xi in range(1, win_xsize+1):
+                flow_dir_mfd = flow_dir_mfd_buffer_array[yi, xi]
+                if flow_dir_mfd == 0:
+                    # no flow in this pixel, so skip
+                    continue
+
+                for i_n in range(8):
+                    if ((flow_dir_mfd >> (i_n * 4)) & 0xF) == 0:
+                        # no flow in that direction
+                        continue
+                    xi_n = xi+D8_XOFFSET[i_n]
+                    yi_n = yi+D8_YOFFSET[i_n]
+
+                    if flow_dir_mfd_buffer_array[yi_n, xi_n] == 0:
+                        # if the entire value is zero, it flows nowhere
+                        # and the root pixel is draining to it, thus the
+                        # root must be a drain
+                        xi_root = xi-1+xoff
+                        yi_root = yi-1+yoff
+                        if weight_raster is not None:
+                            weight_val = <double>weight_raster.get(
+                                xi_root, yi_root)
+                            if _is_close(weight_val, weight_nodata, 1e-8, 1e-5):
+                                weight_val = 0.0
+                        else:
+                            weight_val = 1.0
+                        search_stack.push(
+                            FlowPixelType(xi_root, yi_root, 0, weight_val))
+                        visited_managed_raster.set(xi_root, yi_root, 1)
+                        visit_count += 1
+                        break
+
+                while not search_stack.empty():
+                    flow_pixel = search_stack.top()
+                    search_stack.pop()
+
+                    if ctime(NULL) - last_log_time > _LOGGING_PERIOD:
+                        last_log_time = ctime(NULL)
+                        LOGGER.info(
+                            'mfd flow accum %.1f%% complete',
+                            100.0 * visit_count / float(pixel_count))
+
+                    preempted = 0
+                    for i_n in range(flow_pixel.last_flow_dir, 8):
+                        xi_n = flow_pixel.xi+D8_XOFFSET[i_n]
+                        yi_n = flow_pixel.yi+D8_YOFFSET[i_n]
+                        if (xi_n < 0 or xi_n >= raster_x_size or
+                                yi_n < 0 or yi_n >= raster_y_size):
+                            # no upstream here
+                            continue
+                        compressed_upstream_flow_dir = (
+                            <int>flow_dir_managed_raster.get(xi_n, yi_n))
+                        upstream_flow_weight = (
+                            compressed_upstream_flow_dir >> (
+                                D8_REVERSE_DIRECTION[i_n] * 4)) & 0xF
+                        if upstream_flow_weight == 0:
+                            # no upstream flow to this pixel
+                            continue
+                        upstream_flow_accum = (
+                            flow_accum_managed_raster.get(xi_n, yi_n))
+                        if (_is_close(upstream_flow_accum, flow_accum_nodata, 1e-8, 1e-5)
+                                and not visited_managed_raster.get(
+                                    xi_n, yi_n)):
+                            # process upstream before this one
+                            flow_pixel.last_flow_dir = i_n
+                            search_stack.push(flow_pixel)
+                            if weight_raster is not None:
+                                weight_val = <double>weight_raster.get(
+                                    xi_n, yi_n)
+                                if _is_close(weight_val, weight_nodata, 1e-8, 1e-5):
+                                    weight_val = 0.0
+                            else:
+                                weight_val = 1.0
+                            search_stack.push(
+                                FlowPixelType(xi_n, yi_n, 0, weight_val))
+                            visited_managed_raster.set(xi_n, yi_n, 1)
+                            visit_count += 1
+                            preempted = 1
+                            break
+                        upstream_flow_dir_sum = 0
+                        for i_upstream_flow in range(8):
+                            upstream_flow_dir_sum += (
+                                compressed_upstream_flow_dir >> (
+                                    i_upstream_flow * 4)) & 0xF
+
+                        flow_pixel.value += (
+                            upstream_flow_accum * upstream_flow_weight /
+                            <float>upstream_flow_dir_sum)
+                    if not preempted:
+                        flow_pixel.value /= cell_size * avg_aspect_managed_raster.get(
+                            flow_pixel.xi, flow_pixel.yi)
+                        flow_accum_managed_raster.set(
+                            flow_pixel.xi, flow_pixel.yi,
+                            flow_pixel.value)
+    flow_accum_managed_raster.close()
+    flow_dir_managed_raster.close()
+    if weight_raster is not None:
+        weight_raster.close()
+    visited_managed_raster.close()
+    try:
+        shutil.rmtree(tmp_dir)
+    except OSError:
+        LOGGER.exception("couldn't remove temp dir")
+    LOGGER.info('%.1f%% complete', 100.0)
+
