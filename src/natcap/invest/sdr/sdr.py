@@ -190,6 +190,7 @@ _INTERMEDIATE_BASE_FILES = {
     'w_accumulation_path': 'w_accumulation.tif',
     'w_bar_path': 'w_bar.tif',
     'w_path': 'w.tif',
+    'x_term_path': 'desmet_govers_x.tif',
     'ws_inverse_path': 'ws_inverse.tif',
     'e_prime_path': 'e_prime.tif',
     'weighted_avg_aspect_path': 'weighted_avg_aspect.tif',
@@ -408,6 +409,16 @@ def execute(args):
         dependent_task_list=[pit_fill_task],
         task_name='Calculate true aspect'
     )
+
+    desmet_govers_x_term = task_graph.add_task(
+        _calculate_desmet_govers_x_term,
+        kwargs={
+            'true_aspect_path': f_reg['true_aspect_path'],
+            'target_x_term_path': f_reg['x_term_path'],
+        },
+        target_path_list=[f_reg['x_term_path']],
+        dependent_task_list=[true_aspect_task],
+        task_name='Calculate D&G x term')
 
     ls_factor_SAGA_task = task_graph.add_task(
         func=_calculate_ls_factor_SAGA,
@@ -962,6 +973,24 @@ def _calculate_ls_factor_SAGA(
         ls_factor_function, target_ls_prime_factor_path, gdal.GDT_Float32,
         _TARGET_NODATA)
 
+
+def _calculate_desmet_govers_x_term(true_aspect_path, target_x_term_path):
+    aspect_nodata = pygeoprocessing.get_raster_info(
+        true_aspect_path)['nodata'][0]
+
+    def _calculate_x_term(aspect):
+        valid_pixels = ~utils.array_equals_nodata(aspect, aspect_nodata)
+
+        x_array = numpy.full(aspect.shape, _TARGET_NODATA, dtype=numpy.float32)
+        x_array[valid_pixels] = (
+            numpy.fabs(numpy.sin(aspect[valid_pixels])) +
+            numpy.fabs(numpy.cos(aspect[valid_pixels])))
+
+        return x_array
+
+    pygeoprocessing.raster_calculator(
+        [(true_aspect_path, 1)], _calculate_x_term, target_x_term_path,
+        gdal.GDT_Float32, _TARGET_NODATA)
 
 
 def _calculate_rkls(
