@@ -17,14 +17,13 @@ import taskgraph
 from osgeo import gdal
 from osgeo import ogr
 
-from ..model_metadata import MODEL_METADATA
 from .. import gettext
 from .. import spec_utils
 from .. import utils
 from .. import validation
+from ..model_metadata import MODEL_METADATA
 from ..spec_utils import u
 from . import sdr_core
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -177,6 +176,7 @@ _INTERMEDIATE_BASE_FILES = {
     'ic_bare_soil_path': 'ic_bare_soil.tif',
     'ic_path': 'ic.tif',
     'ls_path': 'ls.tif',
+    'ls_saga_path': 'ls_saga.tif',
     'pit_filled_dem_path': 'pit_filled_dem.tif',
     's_accumulation_path': 's_accumulation.tif',
     's_bar_path': 's_bar.tif',
@@ -186,6 +186,7 @@ _INTERMEDIATE_BASE_FILES = {
     'slope_path': 'slope.tif',
     'thresholded_slope_path': 'slope_threshold.tif',
     'thresholded_w_path': 'w_threshold.tif',
+    'true_aspect_path': 'aspect_true.tif',
     'w_accumulation_path': 'w_accumulation.tif',
     'w_bar_path': 'w_bar.tif',
     'w_path': 'w.tif',
@@ -394,6 +395,33 @@ def execute(args):
         dependent_task_list=[
             flow_accumulation_task, slope_task,
             weighted_avg_aspect_task],
+        task_name='ls factor calculation')
+
+    true_aspect_task = task_graph.add_task(
+        func=sdr_core.calculate_aspect,
+        kwargs={
+            'dem_path': f_reg['pit_filled_dem_path'],
+            'target_aspect_path': f_reg['true_aspect_path'],
+            'use_degrees': False
+        },
+        target_path_list=[f_reg['true_aspect_path']],
+        dependent_task_list=[pit_fill_task],
+        task_name='Calculate true aspect'
+    )
+
+    ls_factor_SAGA_task = task_graph.add_task(
+        func=_calculate_ls_factor_SAGA,
+        args=(
+            f_reg['flow_accumulation_path'],
+            f_reg['slope_path'],
+            f_reg['true_aspect_path'],
+            f_reg['weighted_avg_aspect_path'],
+            float(args['l_max']),
+            f_reg['ls_saga_path']),
+        target_path_list=[f_reg['ls_saga_path']],
+        dependent_task_list=[
+            flow_accumulation_task, slope_task,
+            weighted_avg_aspect_task, true_aspect_task],
         task_name='ls factor calculation')
 
     stream_task = task_graph.add_task(
@@ -834,6 +862,109 @@ def _calculate_ls_factor(
             (l_max, 'raw')],
         ls_factor_function, target_ls_prime_factor_path, gdal.GDT_Float32,
         _TARGET_NODATA)
+
+
+def _calculate_ls_factor_SAGA(
+        flow_accumulation_path, slope_path, true_aspect_path, avg_aspect_path,
+        l_max, target_ls_prime_factor_path):
+    """calculate ls factor to match SAGA.
+
+    Calculates a modified ls factor as equation 3 from "extension and
+    validation of a geographic information system-based method for calculating
+    the revised universal soil loss equation length-slope factor for erosion
+    risk assessments in large watersheds" where the ``x`` term is the average
+    aspect ratio weighted by proportional flow to account for multiple flow
+    direction.
+
+    Args:
+        flow_accumulation_path (string): path to raster, pixel values are the
+            contributing upslope area at that cell. Pixel size is square.
+        slope_path (string): path to slope raster as a percent
+        avg_aspect_path (string): the path to to raster of the weighted average
+            of aspects based on proportional flow.
+        l_max (float): if the calculated value of l exceeds this value
+            it is clamped to this value.
+        target_ls_prime_factor_path (string): path to output ls_prime_factor
+            raster
+
+    Returns:
+        none
+
+    """
+    slope_nodata = pygeoprocessing.get_raster_info(slope_path)['nodata'][0]
+    avg_aspect_nodata = pygeoprocessing.get_raster_info(
+        avg_aspect_path)['nodata'][0]
+
+    flow_accumulation_info = pygeoprocessing.get_raster_info(
+        flow_accumulation_path)
+    flow_accumulation_nodata = flow_accumulation_info['nodata'][0]
+    cell_size = abs(flow_accumulation_info['pixel_size'][0])
+    cell_area = cell_size ** 2
+
+    def ls_factor_function(
+            percent_slope, flow_accumulation, true_aspect, l_max):
+        """Calculate the LS' factor.
+
+        Args:
+            percent_slope (numpy.ndarray): slope in percent
+            flow_accumulation (numpy.ndarray): upslope pixels
+            avg_aspect (numpy.ndarray): the weighted average aspect from mfd
+            l_max (float): max l factor, clamp to this value if l exceeds it
+
+        Returns:
+            ls_factor
+
+        """
+        # avg aspect intermediate output should always have a defined
+        # nodata value from pygeoprocessing
+        valid_mask = (
+            (~utils.array_equals_nodata(true_aspect, avg_aspect_nodata)) &
+            ~utils.array_equals_nodata(percent_slope, slope_nodata) &
+            ~utils.array_equals_nodata(
+                flow_accumulation, flow_accumulation_nodata))
+        result = numpy.empty(valid_mask.shape, dtype=numpy.float32)
+        result[:] = _TARGET_NODATA
+
+        contributing_area = (flow_accumulation[valid_mask]-1) * cell_size
+        slope_in_radians = numpy.arctan(percent_slope[valid_mask] / 100.0)
+
+        beta = (
+            (numpy.sin(slope_in_radians) / 0.0896) /
+            (3 * numpy.sin(slope_in_radians)**0.8 + 0.56))
+
+        m_exp = beta / (1.+beta)
+
+        aspect_length = (
+            numpy.fabs(numpy.sin(true_aspect[valid_mask])) +
+            numpy.fabs(numpy.cos(true_aspect[valid_mask])))
+
+        l_factor = (
+            ((contributing_area + cell_area)**(m_exp+1) -
+             contributing_area ** (m_exp+1)) /
+            ((cell_size ** (m_exp + 2)) * (aspect_length**m_exp) *
+             (22.13**m_exp)))
+
+        # threshold l factor to l_max
+        l_factor[l_factor > l_max] = l_max
+
+        # from equation 4 in "extension and validation of a geographic
+        # information system ..."
+        slope_factor = numpy.where(
+            percent_slope[valid_mask] < 9.0,
+            10.8 * numpy.sin(slope_in_radians) + 0.03,
+            16.8 * numpy.sin(slope_in_radians) - 0.5)
+
+        result[valid_mask] = l_factor * slope_factor
+        return result
+
+    # call vectorize datasets to calculate the ls_factor
+    pygeoprocessing.raster_calculator(
+        [(path, 1) for path in [
+            slope_path, flow_accumulation_path, true_aspect_path]] + [
+            (l_max, 'raw')],
+        ls_factor_function, target_ls_prime_factor_path, gdal.GDT_Float32,
+        _TARGET_NODATA)
+
 
 
 def _calculate_rkls(
