@@ -944,9 +944,6 @@ def _calculate_ls_factor_SAGA(
             ((cell_size ** (m_exp + 2)) * (aspect_length**m_exp) *
              (22.13**m_exp)))
 
-        # threshold l factor to l_max
-        l_factor[l_factor > l_max] = l_max
-
         # from equation 4 in "extension and validation of a geographic
         # information system ..."
         slope_factor = numpy.where(
