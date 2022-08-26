@@ -176,7 +176,10 @@ _INTERMEDIATE_BASE_FILES = {
     'ic_bare_soil_path': 'ic_bare_soil.tif',
     'ic_path': 'ic.tif',
     'ls_path': 'ls.tif',
-    'ls_saga_path': 'ls_saga.tif',
+    'ls_saga_path_area_0': 'ls_saga_area_0.tif',
+    'ls_saga_path_area_1': 'ls_saga_area_1.tif',
+    'ls_saga_path_area_2': 'ls_saga_area_2.tif',
+    'ls_saga_path_area_3': 'ls_saga_area_3.tif',
     'pit_filled_dem_path': 'pit_filled_dem.tif',
     's_accumulation_path': 's_accumulation.tif',
     's_bar_path': 's_bar.tif',
@@ -420,20 +423,22 @@ def execute(args):
         dependent_task_list=[true_aspect_task],
         task_name='Calculate D&G x term')
 
-    ls_factor_SAGA_task = task_graph.add_task(
-        func=_calculate_ls_factor_SAGA,
-        args=(
-            f_reg['flow_accumulation_path'],
-            f_reg['slope_path'],
-            f_reg['true_aspect_path'],
-            f_reg['weighted_avg_aspect_path'],
-            float(args['l_max']),
-            f_reg['ls_saga_path']),
-        target_path_list=[f_reg['ls_saga_path']],
-        dependent_task_list=[
-            flow_accumulation_task, slope_task,
-            weighted_avg_aspect_task, true_aspect_task],
-        task_name='ls factor calculation')
+    for area_method in (0, 1, 2, 3):
+        _ = task_graph.add_task(
+            func=_calculate_ls_factor_SAGA,
+            args=(
+                f_reg['flow_accumulation_path'],
+                f_reg['slope_path'],
+                f_reg['true_aspect_path'],
+                f_reg['weighted_avg_aspect_path'],
+                float(args['l_max']),
+                f_reg[f'ls_saga_path_area_{area_method}'],
+                area_method),
+            target_path_list=[f_reg[f'ls_saga_path_area_{area_method}']],
+            dependent_task_list=[
+                flow_accumulation_task, slope_task,
+                weighted_avg_aspect_task, true_aspect_task],
+            task_name=f'ls factor calculation, method {area_method}')
 
     stream_task = task_graph.add_task(
         func=pygeoprocessing.routing.extract_streams_mfd,
@@ -877,7 +882,7 @@ def _calculate_ls_factor(
 
 def _calculate_ls_factor_SAGA(
         flow_accumulation_path, slope_path, true_aspect_path, avg_aspect_path,
-        l_max, target_ls_prime_factor_path):
+        l_max, target_ls_prime_factor_path, specific_catchment_area_method):
     """calculate ls factor to match SAGA.
 
     Calculates a modified ls factor as equation 3 from "extension and
@@ -936,7 +941,27 @@ def _calculate_ls_factor_SAGA(
         result = numpy.empty(valid_mask.shape, dtype=numpy.float32)
         result[:] = _TARGET_NODATA
 
-        contributing_area = (flow_accumulation[valid_mask]-1) * cell_size
+        aspect_length = (
+            numpy.fabs(numpy.sin(true_aspect[valid_mask])) +
+            numpy.fabs(numpy.cos(true_aspect[valid_mask])))
+
+        n_pixels_upstream = flow_accumulation[valid_mask]-1
+
+        if specific_catchment_area_method == 0:
+            contributing_area = n_pixels_upstream * cell_size
+        elif specific_catchment_area_method == 1:
+            contributing_area = (
+                (n_pixels_upstream * cell_area) / (cell_size * aspect_length))
+        elif specific_catchment_area_method == 2:
+            contributing_area = numpy.sqrt(n_pixels_upstream * cell_area)
+        elif specific_catchment_area_method == 3:
+            contributing_area = numpy.full(
+                n_pixels_upstream.shape, 0, dtype=numpy.float32)
+            contributing_area[n_pixels_upstream > 0] = numpy.log(
+                n_pixels_upstream[n_pixels_upstream > 0] * cell_area)
+        else:
+            raise Exception
+
         slope_in_radians = numpy.arctan(percent_slope[valid_mask] / 100.0)
 
         beta = (
@@ -944,10 +969,6 @@ def _calculate_ls_factor_SAGA(
             (3 * numpy.sin(slope_in_radians)**0.8 + 0.56))
 
         m_exp = beta / (1.+beta)
-
-        aspect_length = (
-            numpy.fabs(numpy.sin(true_aspect[valid_mask])) +
-            numpy.fabs(numpy.cos(true_aspect[valid_mask])))
 
         l_factor = (
             ((contributing_area + cell_area)**(m_exp+1) -
