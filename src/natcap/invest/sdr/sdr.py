@@ -172,6 +172,7 @@ _INTERMEDIATE_BASE_FILES = {
     'd_up_path': 'd_up.tif',
     'f_path': 'f.tif',
     'flow_accumulation_path': 'flow_accumulation.tif',
+    'flow_accumulation_log_path': 'flow_accumulation_log_of_area.tif',
     'flow_direction_path': 'flow_direction.tif',
     'ic_bare_soil_path': 'ic_bare_soil.tif',
     'ic_path': 'ic.tif',
@@ -387,6 +388,15 @@ def execute(args):
         dependent_task_list=[flow_dir_task],
         task_name='flow accumulation calculation')
 
+    flow_accumulation_log_task = task_graph.add_task(
+        func=sdr_core.flow_accumulation_mfd,
+        args=(
+            (f_reg['flow_direction_path'], 1),
+            f_reg['flow_accumulation_log_path']),
+        target_path_list=[f_reg['flow_accumulation_log_path']],
+        dependent_task_list=[flow_dir_task],
+        task_name='flow accumulation calculation')
+
     ls_factor_task = task_graph.add_task(
         func=_calculate_ls_factor,
         args=(
@@ -413,7 +423,7 @@ def execute(args):
         task_name='Calculate true aspect'
     )
 
-    desmet_govers_x_term = task_graph.add_task(
+    desmet_govers_x_term_task = task_graph.add_task(
         _calculate_desmet_govers_x_term,
         kwargs={
             'true_aspect_path': f_reg['true_aspect_path'],
@@ -424,10 +434,15 @@ def execute(args):
         task_name='Calculate D&G x term')
 
     for area_method in (0, 1, 2, 3):
+        if area_method == 3:
+            flow_accumulation_path = f_reg['flow_accumulation_log_path']
+        else:
+            flow_accumulation_path = f_reg['flow_accumulation_path']
+
         _ = task_graph.add_task(
             func=_calculate_ls_factor_SAGA,
             args=(
-                f_reg['flow_accumulation_path'],
+                flow_accumulation_path,
                 f_reg['slope_path'],
                 f_reg['true_aspect_path'],
                 f_reg['weighted_avg_aspect_path'],
@@ -437,6 +452,7 @@ def execute(args):
             target_path_list=[f_reg[f'ls_saga_path_area_{area_method}']],
             dependent_task_list=[
                 flow_accumulation_task, slope_task,
+                flow_accumulation_log_task,
                 weighted_avg_aspect_task, true_aspect_task],
             task_name=f'ls factor calculation, method {area_method}')
 
@@ -955,10 +971,9 @@ def _calculate_ls_factor_SAGA(
         elif specific_catchment_area_method == 2:
             contributing_area = numpy.sqrt(n_pixels_upstream * cell_area)
         elif specific_catchment_area_method == 3:
-            contributing_area = numpy.full(
-                n_pixels_upstream.shape, 0, dtype=numpy.float32)
-            contributing_area[n_pixels_upstream > 0] = numpy.log(
-                n_pixels_upstream[n_pixels_upstream > 0] * cell_area)
+            # The flow accumulation values include the log of the upstream
+            # contributing area plus the area of this one pixel.
+            contributing_area = flow_accumulation[valid_mask]
         else:
             raise Exception
 

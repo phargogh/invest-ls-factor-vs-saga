@@ -1109,7 +1109,6 @@ def calculate_average_aspect(
 
 def flow_accumulation_mfd(
         flow_dir_mfd_raster_path_band, target_flow_accum_raster_path,
-        avg_aspect_raster_path_band,
         weight_raster_path_band=None,
         raster_driver_creation_tuple=DEFAULT_GTIFF_CREATION_TUPLE_OPTIONS):
     """Multiple flow direction accumulation.
@@ -1130,7 +1129,6 @@ def flow_accumulation_mfd(
             is a 64 bit float so there is minimal risk of overflow and the
             possibility of handling a float dtype in
             ``weight_raster_path_band``.
-        avg_aspect_raster_path_band (tuple): as here in sdr_core.
         weight_raster_path_band (tuple): optional path and band number to a
             raster that will be used as the per-pixel flow accumulation
             weight. If ``None``, 1 is the default flow accumulation weight.
@@ -1214,9 +1212,6 @@ def flow_accumulation_mfd(
     flow_accum_managed_raster = _ManagedRaster(
         target_flow_accum_raster_path, 1, 1)
 
-    avg_aspect_managed_raster = _ManagedRaster(
-        avg_aspect_raster_path_band[0], avg_aspect_raster_path_band[1], False)
-
     # make a temporary raster to mark where we have visisted
     LOGGER.debug('creating visited raster layer')
     tmp_dir_root = os.path.dirname(target_flow_accum_raster_path)
@@ -1254,7 +1249,8 @@ def flow_accumulation_mfd(
     pixel_count = raster_x_size * raster_y_size
     visit_count = 0
 
-    cdef float cell_size = cmath.fabs(flow_dir_raster_info['cell_size'])
+    cdef float cell_size = cmath.fabs(flow_dir_raster_info['pixel_size'][0])
+    cdef float cell_area = cell_size * cell_size
 
     LOGGER.debug('starting search')
     # this outer loop searches for a pixel that is locally undrained
@@ -1363,7 +1359,7 @@ def flow_accumulation_mfd(
                                 if _is_close(weight_val, weight_nodata, 1e-8, 1e-5):
                                     weight_val = 0.0
                             else:
-                                weight_val = 1.0
+                                weight_val = cell_area
                             search_stack.push(
                                 FlowPixelType(xi_n, yi_n, 0, weight_val))
                             visited_managed_raster.set(xi_n, yi_n, 1)
@@ -1380,11 +1376,9 @@ def flow_accumulation_mfd(
                             upstream_flow_accum * upstream_flow_weight /
                             <float>upstream_flow_dir_sum)
                     if not preempted:
-                        flow_pixel.value /= cell_size * avg_aspect_managed_raster.get(
-                            flow_pixel.xi, flow_pixel.yi)
                         flow_accum_managed_raster.set(
                             flow_pixel.xi, flow_pixel.yi,
-                            flow_pixel.value)
+                            cmath.log(flow_pixel.value))
     flow_accum_managed_raster.close()
     flow_dir_managed_raster.close()
     if weight_raster is not None:
