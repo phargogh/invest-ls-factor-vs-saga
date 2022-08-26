@@ -10,6 +10,5 @@ https://github.com/phargogh/invest.
 
 To run this script and generate the various outputs in the CWD:
 
-```bash
-$ docker run --rm -ti -v$(pwd):/invest -w /invest ghcr.io/phargogh/invest-ls-factor-vs-saga@sha256:bbf9cb863b4f81dda686c0169634226672d7dd3badf585f55e5b9ca040a603bf /bin/bash run-saga-on-gura.sh
-```
+    $ docker run --rm -ti -v$(pwd):/invest -w /invest ghcr.io/phargogh/invest-ls-factor-vs-saga@sha256:bbf9cb863b4f81dda686c0169634226672d7dd3badf585f55e5b9ca040a603bf /bin/bash run-saga-on-gura.sh
+
