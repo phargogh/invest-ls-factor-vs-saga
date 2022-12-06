@@ -397,19 +397,19 @@ def execute(args):
         dependent_task_list=[flow_dir_task],
         task_name='flow accumulation calculation')
 
-    ls_factor_task = task_graph.add_task(
-        func=_calculate_ls_factor,
-        args=(
-            f_reg['flow_accumulation_path'],
-            f_reg['slope_path'],
-            f_reg['weighted_avg_aspect_path'],
-            float(args['l_max']),
-            f_reg['ls_path']),
-        target_path_list=[f_reg['ls_path']],
-        dependent_task_list=[
-            flow_accumulation_task, slope_task,
-            weighted_avg_aspect_task],
-        task_name='ls factor calculation')
+    #ls_factor_task = task_graph.add_task(
+    #    func=_calculate_ls_factor,
+    #    args=(
+    #        f_reg['flow_accumulation_path'],
+    #        f_reg['slope_path'],
+    #        f_reg['weighted_avg_aspect_path'],
+    #        float(args['l_max']),
+    #        f_reg['ls_path']),
+    #    target_path_list=[f_reg['ls_path']],
+    #    dependent_task_list=[
+    #        flow_accumulation_task, slope_task,
+    #        weighted_avg_aspect_task],
+    #    task_name='ls factor calculation')
 
     true_aspect_task = task_graph.add_task(
         func=sdr_core.calculate_aspect,
@@ -423,23 +423,24 @@ def execute(args):
         task_name='Calculate true aspect'
     )
 
-    desmet_govers_x_term_task = task_graph.add_task(
-        _calculate_desmet_govers_x_term,
-        kwargs={
-            'true_aspect_path': f_reg['true_aspect_path'],
-            'target_x_term_path': f_reg['x_term_path'],
-        },
-        target_path_list=[f_reg['x_term_path']],
-        dependent_task_list=[true_aspect_task],
-        task_name='Calculate D&G x term')
+    #desmet_govers_x_term_task = task_graph.add_task(
+    #    _calculate_desmet_govers_x_term,
+    #    kwargs={
+    #        'true_aspect_path': f_reg['true_aspect_path'],
+    #        'target_x_term_path': f_reg['x_term_path'],
+    #    },
+    #    target_path_list=[f_reg['x_term_path']],
+    #    dependent_task_list=[true_aspect_task],
+    #    task_name='Calculate D&G x term')
 
-    for area_method in (0, 1, 2, 3):
+    #for area_method in (0, 1, 2, 3):  # covers all 4 area methods
+    for area_method in [0]:
         if area_method == 3:
             flow_accumulation_path = f_reg['flow_accumulation_log_path']
         else:
             flow_accumulation_path = f_reg['flow_accumulation_path']
 
-        _ = task_graph.add_task(
+        ls_factor_saga_task = task_graph.add_task(
             func=_calculate_ls_factor_SAGA,
             args=(
                 flow_accumulation_path,
@@ -504,14 +505,15 @@ def execute(args):
     rkls_task = task_graph.add_task(
         func=_calculate_rkls,
         args=(
-            f_reg['ls_path'],
+            #f_reg['ls_path'],
+            f_reg['ls_saga_path_area_0'],
             f_reg['aligned_erosivity_path'],
             f_reg['aligned_erodibility_path'],
             drainage_raster_path_task[0],
             f_reg['rkls_path']),
         target_path_list=[f_reg['rkls_path']],
         dependent_task_list=[
-            align_task, drainage_raster_path_task[1], ls_factor_task],
+            align_task, drainage_raster_path_task[1], ls_factor_saga_task],
         task_name='calculate RKLS')
 
     usle_task = task_graph.add_task(
