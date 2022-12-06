@@ -434,7 +434,7 @@ def execute(args):
     #    task_name='Calculate D&G x term')
 
     #for area_method in (0, 1, 2, 3):  # covers all 4 area methods
-    for area_method in [0]:
+    for area_method in [2]:
         if area_method == 3:
             flow_accumulation_path = f_reg['flow_accumulation_log_path']
         else:
@@ -506,7 +506,7 @@ def execute(args):
         func=_calculate_rkls,
         args=(
             #f_reg['ls_path'],
-            f_reg['ls_saga_path_area_0'],
+            f_reg[f'ls_saga_path_area_{area_method}'],
             f_reg['aligned_erosivity_path'],
             f_reg['aligned_erodibility_path'],
             drainage_raster_path_task[0],
